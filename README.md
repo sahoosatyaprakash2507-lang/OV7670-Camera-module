@@ -1,4 +1,3 @@
-# OV7670-Camera-module
 # OV7670 + ESP32 Frame Capture (FPGA-configured, RGB565)
 
 A diagnostic capture pipeline for an **OV7670 camera module (no FIFO)**. An **FPGA** configures the sensor and supplies its clock; an **ESP32** passively samples the pixel bus, stores a downsampled frame, and dumps it over serial as hex. A **Python script** turns that dump into a viewable image.
