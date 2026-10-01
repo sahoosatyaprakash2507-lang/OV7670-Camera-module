@@ -1,273 +1,492 @@
-# OV7670 + ESP32 Frame Capture (FPGA-configured, RGB565)
+# Image Capture Using ESP32 and OV7670
 
-A diagnostic capture pipeline for an **OV7670 camera module (no FIFO)**. An **FPGA** configures the sensor and supplies its clock; an **ESP32** passively samples the pixel bus, stores a downsampled frame, and dumps it over serial as hex. A **Python script** turns that dump into a viewable image.
+A camera image-acquisition project that captures pixel data from an
+**OV7670 camera module** using an **ESP32**, transfers the captured
+frame over USB serial, and reconstructs the image on a computer using
+**Python, NumPy, and OpenCV**.
 
-> **This is a diagnostic tool, not a camera.** Bit-banging a full-speed OV7670 from an ESP32 gives well under 1 fps and occasionally torn lines. Its purpose is to verify that the FPGA-side camera configuration (SCCB registers, XCLK, pixel format, resolution) produces valid image data.
+> **Architecture note:** In this implementation, an external FPGA
+> supplies the OV7670 clock (XCLK) and configures the camera registers
+> over SCCB. The ESP32 handles pixel-data acquisition and serial frame
+> transfer. This is not a standalone ESP32 camera-initialization
+> project.
 
----
+## Table of Contents
 
-## Contents
+-   [Overview](#overview)
+-   [System Architecture](#system-architecture)
+-   [Features](#features)
+-   [Hardware Requirements](#hardware-requirements)
+-   [Wiring](#wiring)
+-   [Frame Format](#frame-format)
+-   [Software Requirements](#software-requirements)
+-   [Getting Started](#getting-started)
+-   [Serial Commands](#serial-commands)
+-   [Python Image Conversion](#python-image-conversion)
+-   [Troubleshooting](#troubleshooting)
+-   [Limitations](#limitations)
+-   [Possible Improvements](#possible-improvements)
+-   [Project Files](#project-files)
+-   [Contributing](#contributing)
+-   [License](#license)
 
-- [How it works](#how-it-works)
-- [Repository layout](#repository-layout)
-- [Hardware](#hardware)
-- [Wiring](#wiring)
-- [ESP32 firmware](#esp32-firmware)
-- [Python viewer](#python-viewer)
-- [Frame dump format](#frame-dump-format)
-- [Quick start](#quick-start)
-- [Troubleshooting](#troubleshooting)
-- [Known limitations](#known-limitations)
-- [Tuning and customization](#tuning-and-customization)
+## Overview
 
----
+The OV7670 produces a parallel pixel-data stream accompanied by
+synchronization and pixel-clock signals. The ESP32 samples this stream
+and stores a reduced image in an RGB565 frame buffer.
 
-## How it works
+The camera's configured sensor raster is **320 × 240 (QVGA)**. The
+firmware stores every second source row and every second source column,
+producing a **160 × 120** image. Each stored pixel uses 16-bit RGB565
+encoding.
 
-```mermaid
-flowchart LR
-    FPGA["FPGA<br/>(SCCB master + XCLK source)"] -- "SIOC / SIOD / XCLK / PWDN / RESET" --> CAM["OV7670<br/>(no FIFO)"]
-    CAM -- "PCLK, VSYNC, HREF, D0-D7" --> ESP["ESP32<br/>capture-only sketch"]
-    FPGA -. "cfg_done (optional)" .-> ESP
-    ESP -- "USB serial, 115200 baud<br/>hex frame dump" --> PC["PC<br/>dump_to_image.py"]
-    PC --> IMG["frame_out.png"]
+The ESP32 prints the frame as hexadecimal text over serial. A Python
+utility parses the dump, decodes RGB565 pixels, and saves a standard
+image file such as PNG.
+
+## System Architecture
+
+``` text
+                 SCCB configuration + XCLK
+             +-------------------------------+
+             |                               v
+        +---------+                     +---------+
+        |   FPGA  |-------------------->| OV7670  |
+        +---------+                     +---------+
+                                             |
+                              D0-D7, PCLK, HREF, VSYNC
+                                             |
+                                             v
+                                        +---------+
+                                        |  ESP32  |
+                                        | Capture |
+                                        +---------+
+                                             |
+                                      USB Serial
+                                  RGB565 hex frame dump
+                                             |
+                                             v
+                                    +----------------+
+                                    | Python utility |
+                                    | NumPy + OpenCV |
+                                    +----------------+
+                                             |
+                                             v
+                                         PNG image
 ```
 
-**Key design decision:** the FPGA is the *only* SCCB master and the *only* XCLK source. Earlier versions of the ESP32 sketch also configured the sensor and generated XCLK, which created two masters/clock drivers on the same pins and produced garbled, noisy captures. The ESP32 now only **reads** `PCLK`, `HREF`, `VSYNC` and `D0–D7`.
+### Main processing stages
 
-**Capture flow**
+1.  **Camera setup:** The FPGA generates XCLK and configures the OV7670
+    through SCCB.
+2.  **Frame synchronization:** The ESP32 uses VSYNC to identify a frame
+    and HREF to identify active lines.
+3.  **Pixel sampling:** The ESP32 reads the eight camera data bits in
+    synchronization with PCLK.
+4.  **Frame storage:** The firmware combines two bytes into each RGB565
+    pixel and stores every second row and column.
+5.  **Serial transfer:** The ESP32 sends frame metadata and hexadecimal
+    pixel values.
+6.  **Image reconstruction:** Python parses the dump, converts RGB565 to
+    color pixels, and writes an image file.
 
-1. ESP32 waits for the FPGA's `cfg_done` signal (or a fixed 2.5 s delay if not wired).
-2. On command (`c`), it waits for a VSYNC pulse, then reads all 240 lines of the sensor's QVGA output. For each pixel it samples two bytes (high, then low) on consecutive PCLK cycles.
-3. Because a plain ESP32 lacks the RAM for a 320×240×2-byte frame (153,600 bytes), only every other row and column is stored (2×2 nearest-neighbour downsample), giving a **160×120** buffer (38,400 bytes). All real pixels are still read to stay in sync with HREF/PCLK.
-4. On command (`d`), the frame is printed over serial as hex between `---BEGIN FRAME---` / `---END FRAME---` markers.
-5. The Python script parses the dump, decodes RGB565, and writes an image.
+## Features
 
----
+-   OV7670 parallel camera data acquisition.
+-   ESP32 GPIO sampling using VSYNC, HREF, and PCLK.
+-   FPGA-based camera clock and SCCB configuration.
+-   QVGA sensor input with a 160 × 120 stored frame.
+-   16-bit RGB565 pixel format.
+-   Serial frame dump at 115200 baud.
+-   Python conversion from a serial dump or saved text file to an image.
+-   Optional byte-alignment, duplicate-row, blur, and rotation
+    processing in the supplied Python utilities.
+-   Firmware diagnostics and serial commands for capture and frame
+    inspection.
 
-## Repository layout
+## Hardware Requirements
 
-| File | Description |
-|---|---|
-| `ov7670_esp32_565.ino` | ESP32 (Arduino-ESP32 core 3.x) capture-only sketch |
-| `dump_to_image.py` | PC-side script: serial capture or log file → PNG (numpy + OpenCV) |
+-   ESP32 development board compatible with the supplied Arduino sketch.
+-   OV7670 camera module.
+-   FPGA board/design that provides the camera XCLK and SCCB
+    configuration.
+-   USB cable for ESP32 programming and serial communication.
+-   Jumper wires.
+-   Computer with Python installed.
 
-The FPGA design (referenced in the sketch as `ov7670_top.v`, `ov7670_config.v`, `sccb_master`, `xclk_gen.v`) lives outside this repo. *(Add a link here if it's published separately.)*
+### Power and electrical note
 
----
-
-## Hardware
-
-- ESP32 dev board (plain ESP32, no PSRAM required)
-- OV7670 module **without** onboard FIFO (e.g. the common 18-pin module)
-- FPGA board running the camera configuration/clock design
-- USB cable for the ESP32 (serial at 115200 baud)
-
-**Required sensor configuration (set by the FPGA):**
-
-| Setting | Value |
-|---|---|
-| Resolution | QVGA 320×240 (COM7 QVGA bit) |
-| Pixel format | RGB565 (COM7 RGB bit set, reg `0x8C` RGB444 bit clear) |
-| Output | Two bytes per pixel, high byte first |
-
-The sketch can alternatively decode RGB444 (`xRGB` or `RGBx`) by changing `PIXEL_FORMAT` (see [Tuning](#tuning-and-customization)), but the Python viewer in this repo decodes **RGB565 only**.
-
----
+The supplied wiring notes specify **3.3 V** for the camera and warn
+against applying 5 V. Check the specifications of your exact camera
+breakout and development boards before wiring. Connect the grounds of
+the ESP32, FPGA, and camera system together.
 
 ## Wiring
 
-> **3.3 V only. Never connect the OV7670 to 5 V.** Ground must be common between the camera, ESP32 and FPGA.
+The following mapping is taken from the supplied ESP32 firmware.
 
-| OV7670 pin | Connects to | Notes |
-|---|---|---|
-| 3V3 | 3V3 | |
-| GND | GND | Common ground is mandatory |
-| SIOC (SCL) | **FPGA only** | Do not wire to ESP32 |
-| SIOD (SDA) | **FPGA only** | Do not wire to ESP32 |
-| XCLK | **FPGA only** | Do not wire to ESP32 |
-| PWDN | **FPGA only** | Tied low in `ov7670_top.v` |
-| RESET | **FPGA only** | Tied high in `ov7670_top.v` |
-| PCLK | ESP32 GPIO25 | |
-| VSYNC | ESP32 GPIO27 | |
-| HREF | ESP32 GPIO14 | |
-| D0 | ESP32 GPIO4 | |
-| D1 | ESP32 GPIO5 | |
-| D2 | ESP32 GPIO18 | |
-| D3 | ESP32 GPIO19 | |
-| D4 | ESP32 GPIO36 | Input-only pin |
-| D5 | ESP32 GPIO39 | Input-only pin |
-| D6 | ESP32 GPIO34 | Input-only pin |
-| D7 | ESP32 GPIO35 | Input-only pin |
-| *(optional)* FPGA `cfg_done` | ESP32 GPIO23 | Lets the ESP32 know the sensor is configured. Set `CFG_DONE_PIN` to `-1` if unwired |
+  OV7670 signal     ESP32 pin Description
+  --------------- ----------- ------------------------
+  D0                   GPIO 4 Pixel data bit 0
+  D1                   GPIO 5 Pixel data bit 1
+  D2                  GPIO 18 Pixel data bit 2
+  D3                  GPIO 19 Pixel data bit 3
+  D4                  GPIO 36 Pixel data bit 4
+  D5                  GPIO 39 Pixel data bit 5
+  D6                  GPIO 34 Pixel data bit 6
+  D7                  GPIO 35 Pixel data bit 7
+  PCLK                GPIO 25 Pixel clock
+  VSYNC               GPIO 27 Frame synchronization
+  HREF                GPIO 14 Active-line indication
+  GND                     GND Common ground
+  3V3                   3.3 V Camera power
 
-**Why the pin choice matters:** the sketch reads D0–D7 directly from the GPIO input registers (`GPIO.in` for GPIO0–31, `GPIO.in1` for GPIO32–39) for speed. If you change the data pins, you **must** update `readCameraByte()` to match.
+Additional connections described by the firmware:
 
----
+  ------------------------------------------------------------------------
+  Signal                  Connected to            Description
+  ----------------------- ----------------------- ------------------------
+  SIOC / SIOD             FPGA                    SCCB camera
+                                                  configuration
 
-## ESP32 firmware
+  XCLK                    FPGA                    Camera master clock
 
-**Environment:** Arduino IDE (or PlatformIO) with **Arduino-ESP32 core 3.x**. The sketch sets the CPU to 240 MHz.
+  PWDN / RESET            FPGA                    Camera control, as
+                                                  implemented in the FPGA
+                                                  design
 
-### Serial commands (115200 baud)
+  `cfg_done` (optional)   ESP32 GPIO 23           FPGA
+                                                  configuration-complete
+                                                  status
+  ------------------------------------------------------------------------
 
-| Key | Action |
-|---|---|
-| `c` | Capture a frame and print statistics |
-| `p` | Print the first 20 pixels with R/G/B split |
-| `d` | Dump the entire frame as hex |
-| `w` | Wait for FPGA `cfg_done` again |
-| `h` | Show help |
+**Important:** GPIO 34, 35, 36, and 39 are input-only pins on the
+classic ESP32. The firmware uses them as camera data inputs.
 
-With `AUTO_CAPTURE_ON_BOOT` enabled, the sketch captures one frame at startup and prints statistics plus the first 20 pixels.
+The ESP32 does not drive the OV7670 SIOC, SIOD, or XCLK signals in this
+design. Make sure the FPGA configuration and wiring match the firmware's
+expected camera mode and timing.
 
-### Frame statistics and verdicts
+## Frame Format
 
-After each capture, `frameStats()` prints min/max/mean, the share of all-zero and full-white pixels, and a plain-language verdict:
+  Parameter                                 Value
+  ----------------------------------------- --------------
+  Camera raster described by the firmware   320 × 240
+  Stored frame                              160 × 120
+  Pixel format                              RGB565
+  Bits per pixel                            16
+  Stored pixel count                        19,200
+  Frame buffer size                         38,400 bytes
+  Serial baud rate                          115200
 
-| Verdict | Meaning |
-|---|---|
-| Everything is zero | Data lines not reaching the ESP32, or the FPGA isn't driving the sensor |
-| Everything is full-white | Data pins floating high / disconnected |
-| Padding bits set (RGB444 only) | Format mismatch with reg `0x8C`, or a byte-phase/sync problem |
-| Every pixel identical | Sampling is not in sync with PCLK |
-| Varied data | Looks like a real capture; dump it and view on the PC |
+Each RGB565 pixel is represented by two bytes:
 
-### Capture implementation notes
+-   5 bits for red
+-   6 bits for green
+-   5 bits for blue
 
-- Interrupts are disabled **per line**, not per frame, to avoid tripping the interrupt watchdog. An interrupt between lines may cost a pixel or two at a line's left edge.
-- Every PCLK wait has a guard counter; a line that times out is flagged as degraded. More than 5 bad lines aborts the capture with a hint to lower `CLKRC` on the FPGA.
-- VSYNC and HREF waits have timeouts (2 s and 100 ms respectively) with diagnostic messages.
+The firmware prints each pixel as four hexadecimal characters, with the
+high byte first. Each image row therefore contains 160 × 4 = **640
+hexadecimal characters**, excluding line endings.
 
----
+A frame dump follows this general structure:
 
-## Python viewer
-
-`dump_to_image.py` converts the hex dump into an image. It works either **live over serial** or from a **saved log file**.
-
-### Install
-
-```bash
-pip install numpy opencv-python pyserial
-```
-
-(`pyserial` is only needed for live capture.)
-
-### Usage
-
-```bash
-# Live capture from a serial port (Windows)
-python3 dump_to_image.py COM3
-
-# Live capture with a custom output name (Linux / macOS)
-python3 dump_to_image.py /dev/ttyUSB0 output.png
-
-# Convert a saved serial log instead
-python3 dump_to_image.py --file dump.txt out.png
-```
-
-Defaults: port `COM3`, output `frame_out.png`, file input `frame_dump.txt`.
-
-In live mode the script opens the port at 115200 baud, waits 2 s for the boot banner, sends `c` (capture), waits 1 s, sends `d` (dump), and reads until `---END FRAME---` (10 s timeout).
-
-> A 160×120 frame is ~77,000 hex characters, which takes roughly 6.7 s at 115200 baud, so the default 10 s timeout leaves little margin. If you hit a timeout, raise `timeout` in `capture_frame_over_serial()`.
-
-### Processing pipeline
-
-1. **Parse** the dump (`parse_frame_text`) and extract `WIDTH`, `HEIGHT` and the hex rows. Other log lines are ignored.
-2. **Decode** each row to big-endian RGB565 words (`rows_to_rgb565`). Optional byte-phase alignment (`align`) can salvage rows shifted by one byte: `"none"` (default), `"shift1"`, or `"auto"` (per-row, keeps whichever phase has more high-frequency detail).
-3. **De-duplicate rows** (`detect_duplicate_period`): if rows repeat at a fixed vertical period (e.g. a capture that missed every other HREF), only the unique lines are kept. This is detected automatically rather than assumed.
-4. **Convert** RGB565 → 8-bit BGR (`rgb565_to_bgr888`).
-5. **Upscale** with nearest-neighbour to `WIDTH*4 × HEIGHT*4` (640×480 for a 160×120 frame), so missing or duplicated lines are not smoothed into detail the sensor never produced.
-6. **Post-process** (`process_image`): Gaussian blur (5×5, σ=1.0) and a 180° rotation, both enabled by default to match the camera's mounting orientation. Disable with `gaussian=False` / `rotate_180=False`.
-
-### Using it as a module
-
-```python
-from dump_to_image import dump_to_image, serial_to_image
-
-# From a saved log
-dump_to_image("dump.txt", "out.png", dedupe=True, align="auto",
-              gaussian=True, rotate_180=True)
-
-# Live from the ESP32
-serial_to_image("COM3", "out.png", baud=115200)
-```
-
----
-
-## Frame dump format
-
-```
+``` text
 ---BEGIN FRAME---
 WIDTH=160
 HEIGHT=120
 FORMAT=RGB565
-<hex row 0>
-<hex row 1>
+<hexadecimal pixel data, one row per line>
 ...
 ---END FRAME---
 ```
 
-Each hex row is `WIDTH × 4` characters: 4 hex digits per pixel (`RRRRRGGGGGGBBBBB`, most-significant byte first), one row of pixels per line.
+The dump ends with:
 
----
+``` text
+---END FRAME---
+```
 
-## Quick start
+## Software Requirements
 
-1. Program the FPGA with the camera configuration design (QVGA, RGB565) and wire the camera as in [Wiring](#wiring).
-2. Flash `ov7670_esp32_565.ino` to the ESP32.
-3. Open a serial monitor at 115200 baud. Confirm `cfg_done HIGH` and a **"varied data"** verdict from the statistics.
-4. Close the serial monitor (the port can only be used by one program at a time).
-5. Run `python3 dump_to_image.py <your-port>` and open `frame_out.png`.
+### ESP32 firmware
 
----
+-   Arduino IDE or another Arduino-compatible build environment.
+-   ESP32 board support package compatible with the supplied sketch.
+-   The supplied firmware file: `ov7670_esp32_565.ino`.
+
+The firmware source targets the **Arduino-ESP32 Core 3.x** API.
+
+### Python tools
+
+-   Python 3
+-   NumPy
+-   OpenCV
+-   pySerial (needed for direct serial capture)
+
+Install the dependencies:
+
+``` bash
+python -m pip install numpy opencv-python pyserial
+```
+
+For conversion of an already-saved dump file, pySerial is not required.
+
+## Getting Started
+
+### 1. Connect the hardware
+
+Wire the OV7670 data and synchronization signals to the ESP32 using the
+table above. Connect the FPGA signals required for camera configuration
+and XCLK. Verify the voltage requirements and common ground before
+powering the system.
+
+### 2. Configure the FPGA
+
+Program the FPGA with the design used by your hardware setup. It must
+provide the OV7670 clock and configure the camera registers over SCCB.
+
+The FPGA design/source is a separate part of the system; it is not
+included in the ESP32 and Python source files described here. Camera
+register settings and exact XCLK frequency therefore depend on the FPGA
+implementation.
+
+### 3. Upload the ESP32 firmware
+
+Open `ov7670_esp32_565.ino` in the Arduino environment, select the
+correct ESP32 board and serial port, and upload the sketch.
+
+The firmware starts serial communication at **115200 baud**. It waits
+for the FPGA configuration-complete signal when that option is enabled;
+otherwise it uses its configured startup delay.
+
+### 4. Capture a frame
+
+Open a serial terminal at 115200 baud. Use the firmware commands
+described below. If automatic capture on boot is enabled in the sketch,
+the ESP32 captures a frame during startup.
+
+### 5. Convert the frame to an image
+
+For direct serial capture, close any serial monitor using the same port,
+then run the relevant Python script. For a saved frame dump, use the
+file-conversion option supported by the selected script.
+
+## Serial Commands
+
+The ESP32 firmware provides these commands:
+
+  -----------------------------------------------------------------------
+  Command                             Action
+  ----------------------------------- -----------------------------------
+  `c`                                 Capture a frame and print frame
+                                      statistics.
+
+  `p`                                 Print the first 20 pixels with RGB
+                                      channel information.
+
+  `d`                                 Dump the complete stored frame as
+                                      hexadecimal RGB565 rows.
+
+  `w`                                 Wait for FPGA configuration
+                                      completion again, or use the
+                                      configured delay fallback.
+
+  `h`                                 Display command help.
+  -----------------------------------------------------------------------
+
+Send the command through a serial terminal configured for 115200 baud.
+
+## Python Image Conversion
+
+The repository includes Python utilities for reading the ESP32 frame
+dump and reconstructing an image. The supplied variants have different
+defaults, so check the selected script's command-line help and options
+before running it.
+
+### Convert a saved dump
+
+The converter supports a file-based workflow. The general form is:
+
+``` bash
+python dump_to_image.py --file frame_dump.txt output.png
+```
+
+Here, `frame_dump.txt` is a text file containing the complete frame
+markers, metadata, and hexadecimal pixel rows.
+
+### Capture from the ESP32 serial port
+
+The live-capture workflow opens the serial port, requests a capture,
+asks the firmware to dump the frame, and collects the marker-delimited
+output.
+
+A typical invocation is:
+
+``` bash
+python dump_to_image.py COM3
+```
+
+Or specify an output filename:
+
+``` bash
+python dump_to_image.py COM3 captured.png
+```
+
+Replace `COM3` with the port assigned to the ESP32. On Linux, a port may
+look like `/dev/ttyUSB0` or `/dev/ttyACM0`; on macOS, it may look like
+`/dev/cu.usbserial-XXXX`.
+
+Close the Arduino Serial Monitor or any other application using the same
+serial port before starting live capture.
+
+### RGB565 decoding
+
+For each 16-bit pixel value, the decoder extracts the channels:
+
+``` python
+red   = (pixel >> 11) & 0x1F
+green = (pixel >> 5)  & 0x3F
+blue  =  pixel        & 0x1F
+```
+
+The channel values are expanded to 8-bit color values for image output.
+The Python implementation accounts for OpenCV's BGR channel ordering
+when constructing the image.
+
+### Image correction options
+
+Depending on the selected utility and its parameters, the scripts
+include processing options such as:
+
+-   **Byte alignment:** `none`, `shift1`, or automatic per-row
+    alignment.
+-   **Duplicate-row detection:** identifies possible repeated vertical
+    scan-line patterns.
+-   **Duplicate-row removal:** optionally removes detected repeated rows
+    and resizes the result.
+-   **Gaussian blur:** applies a 5 × 5 blur in the supplied
+    implementation.
+-   **180-degree rotation:** changes image orientation when required.
+-   **Output resizing:** the supplied script variants use different
+    default output dimensions.
+
+These are post-processing measures for inspecting or mitigating capture
+artefacts. They do not correct the underlying camera timing or wiring.
 
 ## Troubleshooting
 
-| Symptom | Likely cause / fix |
-|---|---|
-| `VSYNC never went HIGH` | FPGA not programmed or running, `cfg_done` low, or VSYNC not on GPIO27 |
-| `HREF timeout at line N` | `SENSOR_WIDTH/HEIGHT` don't match the FPGA's QVGA configuration |
-| `PCLK timeout, too many bad lines` | PCLK is too fast for polling. Lower the PCLK on the FPGA (increase `CLKRC` divider in `ov7670_config.v`) |
-| Noisy/garbled image | Check that the ESP32 isn't driving SCCB or XCLK. Capturing before configuration finished also looks like noise, so wait for `cfg_done` |
-| Smooth, blended, detail-free lines | Byte-phase slip from a late PCLK sample. Try `align="auto"`; the real fix is a more reliable capture method |
-| Wrong colors | Sensor format doesn't match `PIXEL_FORMAT` in the sketch, or register `0x8C` is misconfigured |
-| Repeated image rows | Missed HREF pulses. The viewer's de-duplication handles it; the root cause is capture timing |
-| Image upside down | Toggle `rotate_180` |
-| `Did not see ---END FRAME---` | Timeout too short for the dump, wrong port, or the board reset. Raise the timeout |
+  -----------------------------------------------------------------------
+  Symptom                             Checks
+  ----------------------------------- -----------------------------------
+  VSYNC timeout                       Check GPIO 27 wiring, FPGA
+                                      configuration, camera power, and
+                                      synchronization output.
 
----
+  HREF timeout                        Check GPIO 14 wiring and the
+                                      camera's configured output mode.
 
-## Known limitations
+  PCLK timeout                        Check GPIO 25, FPGA XCLK
+                                      generation, camera clock
+                                      configuration, and signal
+                                      integrity.
 
-- **Polling, not hardware-timed.** `GPIO.in` polling can't guarantee every PCLK edge at the camera's full pixel clock. Expect torn lines and sub-1 fps.
-- **Downsampled storage.** Output is 160×120 (2×2 nearest-neighbour from 320×240) because a plain ESP32 can't hold the full frame.
-- **Config must match.** The sketch cannot configure the sensor; mismatches with the FPGA register settings show up as corrupted-looking data.
-- **Viewer is RGB565-only.** The firmware can emit RGB444, but `dump_to_image.py` does not decode it.
-- **Frame stats thresholds** (95% zero / white, 5% pad bits) are heuristics.
+  Image is mostly black               Check the data bus connections,
+                                      common ground, camera
+                                      configuration, and pixel sampling.
 
-For a real fix, move to an interrupt/DMA/I2S-parallel-based capture, or a camera with onboard FIFO.
+  Image is mostly white               Check for floating or incorrectly
+                                      connected data pins.
 
----
+  All pixels have the same value      Check PCLK synchronization and
+                                      whether the ESP32 is sampling valid
+                                      camera data.
 
-## Tuning and customization
+  Colors look incorrect               Verify RGB565 byte order and
+                                      RGB/BGR channel conversion.
 
-Key `#define`s in `ov7670_esp32_565.ino`:
+  Image has shifted rows or columns   Inspect byte alignment and
+                                      synchronization timing.
 
-| Define | Purpose |
-|---|---|
-| `SENSOR_WIDTH` / `SENSOR_HEIGHT` | Real sensor output (320×240); must match the FPGA |
-| `FRAME_WIDTH` / `FRAME_HEIGHT` | Stored size (default: half of sensor size) |
-| `PIXEL_FORMAT` | `PIXEL_FORMAT_RGB565` (default) or `PIXEL_FORMAT_RGB444` |
-| `RGB444_USE_RGBX` | RGB444 byte order (`0x8C=0x03` → RGBx, `0x8C=0x02` → xRGB) |
-| `CFG_DONE_PIN` / `CFG_DONE_TIMEOUT_MS` | FPGA ready signal and fallback timeout (`-1` to disable the pin) |
-| `AUTO_CAPTURE_ON_BOOT` | Capture one frame at startup |
+  Repeated horizontal bands           Inspect HREF handling and line
+                                      capture timing.
 
-**Storing the full frame:** on a PSRAM board (e.g. WROVER), set `FRAME_WIDTH/HEIGHT` equal to the sensor size and allocate `frameBuffer` with `heap_caps_malloc(..., MALLOC_CAP_SPIRAM)`.
+  Python cannot open the serial port  Close other serial applications and
+                                      verify the port name and
+                                      permissions.
 
----
+  Incomplete frame dump               Check the serial connection,
+                                      capture/dump timeouts, and the
+                                      beginning/end frame markers.
+  -----------------------------------------------------------------------
 
-## License
+## Limitations
 
-*Add your license here (e.g. MIT).*
+-   An external FPGA is required for the camera clock and SCCB
+    configuration in this implementation.
+-   The stored image is 160 × 120, not the full 320 × 240 sensor raster.
+-   Pixel acquisition uses ESP32 GPIO polling and is sensitive to PCLK
+    and synchronization timing.
+-   Interrupt masking is used during time-critical portions of each
+    line; timing disturbances may still affect pixels.
+-   Serial hexadecimal output is larger than packed binary pixel data
+    and takes additional transfer time.
+-   Python correction routines cannot restore pixel information that was
+    never captured correctly.
+-   The supplied source set does not include the FPGA HDL/configuration,
+    a complete board-specific bill of materials, or measured
+    image-quality and frame-rate results.
+
+## Possible Improvements
+
+-   Investigate hardware-assisted parallel capture or DMA for more
+    deterministic pixel sampling.
+-   Evaluate packed binary serial transfer to reduce transmission
+    overhead.
+-   Add frame length checks and checksums to detect corrupted or
+    incomplete transfers.
+-   Improve synchronization and pixel-clock timing validation.
+-   Add configurable image dimensions and pixel formats, ensuring the
+    FPGA camera configuration and ESP32 capture logic remain consistent.
+-   Use suitable external memory, such as PSRAM on a compatible board,
+    if a larger frame buffer is required.
+-   Add sample output images and a verified wiring diagram to the
+    repository.
+
+## Project Files
+
+The source set used for this documentation contains the following files:
+
+  -----------------------------------------------------------------------
+  File                                Purpose
+  ----------------------------------- -----------------------------------
+  `ov7670_esp32_565.ino`              ESP32 camera pixel acquisition,
+                                      frame buffer, diagnostics, serial
+                                      commands, and RGB565 dump.
+
+  `dump_to_image.py`                  Python frame-dump conversion
+                                      utility with live serial and
+                                      saved-file workflows.
+
+  `dump_to_image_160.py`              Converter variant with native 160 ×
+                                      120 output default.
+
+  `dump_to_image_320 - Copy.py`       Converter variant with 320 × 240
+                                      output default.
+  -----------------------------------------------------------------------
+
+If you rename the Python files for a public repository, update the
+example commands above to match the names you commit.
+
+## Contributing
+
+Contributions, bug reports, wiring corrections, and improvements to
+capture reliability are welcome. When submitting a change, include:
+
+-   ESP32 board model and Arduino-ESP32 core version.
+-   FPGA board and camera clock/configuration details.
+-   The wiring or pin changes.
+-   A sample frame dump and resulting image, where possible.
+-   Steps to reproduce any issue.
+
